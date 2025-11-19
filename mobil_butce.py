@@ -12,15 +12,23 @@ st.set_page_config(page_title="Aile Bütçesi", page_icon="🏠", layout="center
 # --- MAAŞ GÜNÜ ---
 MAAS_GUNU = 19 
 
-# --- GOOGLE SHEETS BAĞLANTISI ---
+# --- GOOGLE SHEETS BAĞLANTISI (DÜZELTİLEN KISIM) ---
 @st.cache_resource
 def baglanti_kur():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    if "gcp_service_account" in st.secrets:
-        creds_dict = st.secrets["gcp_service_account"]
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    
+    # Önce Streamlit Cloud'daki Gizli Kasaya bakmayı dene
+    try:
+        if "gcp_service_account" in st.secrets:
+            creds_dict = st.secrets["gcp_service_account"]
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            return client
+    except:
+        pass # Eğer PC'deysen ve secrets yoksa burayı sessizce geç
+    
+    # Eğer yukarıdaki çalışmadıysa (PC'desin demektir), dosyadan oku
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     client = gspread.authorize(creds)
     return client
 
@@ -40,7 +48,6 @@ def kullanici_ekle(kadi, sifre):
     users_sheet = client.open("ButceVerileri").worksheet("Kullanicilar")
     veriler = users_sheet.get_all_records()
     
-    # Kullanıcı adı var mı kontrol et
     for user in veriler:
         if str(user['KullaniciAdi']) == kadi:
             return False, "Bu kullanıcı adı zaten alınmış!"
@@ -51,28 +58,21 @@ def kullanici_ekle(kadi, sifre):
 def sifre_degistir(kadi, yeni_sifre):
     client = baglanti_kur()
     users_sheet = client.open("ButceVerileri").worksheet("Kullanicilar")
-    cell = users_sheet.find(kadi)
-    users_sheet.update_cell(cell.row, 2, yeni_sifre) # 2. Sütun Şifre
+    # Satırı bulmak için basit arama
+    veriler = users_sheet.get_all_records()
+    for i, row in enumerate(veriler):
+        if str(row['KullaniciAdi']) == kadi:
+            users_sheet.update_cell(i + 2, 2, yeni_sifre) # Header yüzünden +2
+            return
 
 def hesap_sil(kadi):
     client = baglanti_kur()
-    # 1. Kullanıcıyı sil
     users_sheet = client.open("ButceVerileri").worksheet("Kullanicilar")
-    cell = users_sheet.find(kadi)
-    users_sheet.delete_rows(cell.row)
-    
-    # 2. Kullanıcının TÜM verilerini sil (Temizlik)
-    data_sheet = client.open("ButceVerileri").sheet1
-    veriler = data_sheet.get_all_records()
-    # Tersten silmek gerekir ki indexler kaymasın
-    rows_to_delete = []
+    veriler = users_sheet.get_all_records()
     for i, row in enumerate(veriler):
-        if str(row.get('Kullanici', '')).lower() == kadi.lower():
-            rows_to_delete.append(i + 2) # Header + 1-based
-            
-    # Toplu silme API'de zor olduğu için kullanıcıyı uyaracağız sadece
-    # (Gerçek uygulamada batch delete yapılır ama burada basit tutalım)
-    pass 
+        if str(row['KullaniciAdi']) == kadi:
+            users_sheet.delete_rows(i + 2)
+            return
 
 # --- VERİLERİ ÇEK ---
 def verileri_getir(aktif_kullanici):
@@ -82,7 +82,6 @@ def verileri_getir(aktif_kullanici):
     df = pd.DataFrame(veriler)
     
     if not df.empty and 'Kullanici' in df.columns:
-        # Sadece kendi verisini görsün
         df = df[df['Kullanici'].astype(str) == aktif_kullanici]
         
         if not df.empty:
@@ -175,14 +174,12 @@ if not st.session_state['giris_yapildi']:
             else:
                 st.warning("Tüm alanları doldurunuz.")
 
-# --- UYGULAMA İÇİ ---
 else:
     aktif_kullanici = st.session_state['kullanici_adi']
     
     with st.sidebar:
         st.write(f"👤 **{aktif_kullanici.upper()}**")
         
-        # HESAP AYARLARI (Sidebar'da)
         with st.expander("⚙️ Hesap Ayarları"):
             st.write("Şifre Değiştir")
             degis_sifre = st.text_input("Yeni Şifre", type="password", key="s1")
@@ -192,7 +189,6 @@ else:
             
             st.divider()
             
-            st.write("Hesabı Sil (Dikkat!)")
             if st.button("Hesabımı Kalıcı Sil"):
                 hesap_sil(aktif_kullanici)
                 st.session_state['giris_yapildi'] = False
@@ -243,7 +239,6 @@ else:
             acik = st.text_input("Açıklama")
             if st.form_submit_button("KAYDET"):
                 if tutar > 0:
-                    # Kullanıcı adıyla kaydet
                     sheet.append_row([aktif_kullanici, datetime.now().strftime("%Y-%m-%d %H:%M"), kat, tutar, acik])
                     st.success("Kaydedildi!")
                     time.sleep(1)
@@ -261,14 +256,7 @@ else:
         if not df.empty:
             liste = [f"{row['Tarih']} | {row['Kategori']} | {row['Tutar']} TL" for i, row in df.iterrows()]
             secilen = st.selectbox("İşlem yapılacak:", liste)
-            
             idx = df.index[liste.index(secilen)]
-            # Filtrelenmiş df'in orijinal index'ine göre satır numarasını buluyoruz
-            # (Tüm verideki yeri)
-            # Header (1) + 1-based index = +2 AMA,
-            # df_raw tüm veriyi içeriyor. df filtrelenmiş.
-            # En güvenli yol: sheet.find ile satırı bulmak ama aynı veri varsa karışabilir.
-            # Basitlik için: df_raw içindeki indexini bulalım.
             row_num = idx + 2 
             
             with st.form("duzenle"):
@@ -279,10 +267,9 @@ else:
                 nAcik = st.text_input("Açıklama", value=str(row_data[aciklama_col]))
                 
                 if st.form_submit_button("GÜNCELLE"):
-                    # Sütun sırası: A=Kullanici, B=Tarih, C=Kategori, D=Tutar, E=Aciklama
-                    sheet.update_cell(row_num, 3, nKat)   # C
-                    sheet.update_cell(row_num, 4, nTutar) # D
-                    sheet.update_cell(row_num, 5, nAcik)  # E
+                    sheet.update_cell(row_num, 3, nKat)
+                    sheet.update_cell(row_num, 4, nTutar)
+                    sheet.update_cell(row_num, 5, nAcik)
                     st.success("Güncellendi!")
                     time.sleep(1)
                     st.rerun()
